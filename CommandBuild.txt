@@ -1,0 +1,1 @@
+C:\Users\Denis\AppData\Local\Python\pythoncore-3.14-64\Scripts\pyinstaller.exe --onefile --version-file=version.txt --noconsole --icon="icon.ico" --add-data "logo.png;." --add-data "icon.ico;." --clean monitoring_app.py
