@@ -346,12 +346,13 @@ class SpimexParserApp:
             return None
 
     def round_up_thousands(self, price_num):
-        """Переводит сумму в тысячи и округляет до 1 знака в большую сторону"""
+        """
+        Делит цену на 1000 и округляет до 1 знака после запятой.
+        Пример: 180011 -> 180.0 (или 180.011 с округлением)
+        """
         thousands = price_num / 1000.0
-        rounded = math.ceil(thousands * 10) / 10.0
-        if rounded.is_integer():
-            return int(rounded)
-        return rounded
+        # Округляем до 1 знака после запятой (стандартное математическое округление)
+        return round(thousands, 1)
 
     def fetch_ticker_data_for_month(self, ticker, target_month, target_year):
         """
