@@ -9,8 +9,8 @@ from tkinter import filedialog, messagebox, ttk
 import urllib.parse
 from PIL import Image, ImageTk
 import openpyxl
-import pdfplumber
 import requests
+from bs4 import BeautifulSoup
 
 
 def resource_path(relative_path):
@@ -82,9 +82,15 @@ class SpimexParserApp:
                 print(f"Не удалось установить иконку: {e}")
 
         self.file_path = ""
-        self.bulletin_data = {}  # {ticker: price}
-        self.bulletin_date_str = None
+        self.bulletin_data = {}  # {ticker: {date_str: price_rounded}}
         self.excel_tickers = set()
+
+        # Список слов/заголовков для исключения
+        self.excluded_names = {
+            "ортоксилол", "тариф", "толуол", "нефрас с2", "керосин", 
+            "ацетон", "бутанол", "изобутанол", "бгст", "мэг", "фау", 
+            "этилбензол", "наименование", "продукт", "инструмент"
+        }
 
         self.setup_ui()
 
@@ -131,7 +137,7 @@ class SpimexParserApp:
 
         lbl_subtitle = tk.Label(
             title_frame,
-            text="Автоматический парсер PDF бюллетеней",
+            text="Автоматический парсер цен инструментов",
             font=("Segoe UI", 9),
             fg="#9E9EAE",
             bg="#2D2D37",
@@ -228,12 +234,12 @@ class SpimexParserApp:
         self.log_text.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.log_text.yview)
 
-        # Tag for errors/warnings in log
+        # Tags for log styling
         self.log_text.tag_config("error", foreground="#FF5555")
         self.log_text.tag_config("success", foreground="#43C639")
         self.log_text.tag_config("info", foreground="#888899")
 
-        # --- Блок авторских прав (Копирайт) ---
+        # Footer / Copyright
         footer_frame = tk.Frame(self.root, bg="#1E1E24")
         footer_frame.pack(fill=tk.X, side=tk.BOTTOM, pady=(0, 2))
 
@@ -246,7 +252,6 @@ class SpimexParserApp:
         )
         lbl_author.pack(side=tk.RIGHT, padx=15)
 
-        # Status Bar
         self.status_bar = tk.Label(
             footer_frame,
             text="Готов к работе",
@@ -294,20 +299,33 @@ class SpimexParserApp:
             self.log(f"Загружен файл: {filename}", "info")
             self.update_status(f"Загружен файл {basename}")
 
-    def load_excel_tickers(self):
+    def is_valid_ticker(self, val_str):
+        """Проверяет, является ли строка валидным тикером СПбМТСБ"""
+        if not val_str:
+            return False
+        
+        t_clean = str(val_str).strip()
+        t_lower = t_clean.lower()
+
+        if t_lower in self.excluded_names:
+            return False
+
+        if re.match(r"^[A-Z0-9]{7,12}$", t_clean, re.IGNORECASE):
+            return True
+
+        return False
+
+    def load_excel_tickers(self, ws):
+        """Загружает тикеры из указанного листа Excel"""
         self.excel_tickers.clear()
-        wb = openpyxl.load_workbook(self.file_path, data_only=True)
-        ws = wb.active
 
         for row in range(4, ws.max_row + 1):
             val = ws.cell(row=row, column=1).value
-            if val:
-                t_str = str(val).strip()
-                if t_str != "Тариф" and len(t_str) >= 6:
-                    self.excel_tickers.add(t_str)
+            if val and self.is_valid_ticker(val):
+                self.excel_tickers.add(str(val).strip())
 
         self.log(
-            f"Загружено тикеров из Excel: {len(self.excel_tickers)}", "info"
+            f"Найдено действительных тикеров в Excel: {len(self.excel_tickers)}", "info"
         )
 
     def clean_number(self, val_str):
@@ -335,143 +353,107 @@ class SpimexParserApp:
             return int(rounded)
         return rounded
 
-    def parse_pdf_bytes(self, pdf_bytes):
-        self.bulletin_data.clear()
-
-        if not self.excel_tickers:
-            self.log("[!] Ошибка: список тикеров из Excel пуст.", "error")
-            return
-
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                words = page.extract_words()
-                if not words:
-                    continue
-
-                rows_dict = {}
-                for w in words:
-                    top_key = round(w["top"] / 3.0) * 3
-                    if top_key not in rows_dict:
-                        rows_dict[top_key] = []
-                    rows_dict[top_key].append(w)
-
-                sorted_tops = sorted(rows_dict.keys())
-
-                for top_key in sorted_tops:
-                    line_words = sorted(
-                        rows_dict[top_key], key=lambda x: x["x0"]
-                    )
-                    line_text = " ".join([w["text"] for w in line_words])
-
-                    found_ticker = None
-                    for ticker in self.excel_tickers:
-                        if ticker in line_text:
-                            found_ticker = ticker
-                            break
-
-                    if not found_ticker:
-                        continue
-
-                    ticker_idx = line_text.find(found_ticker)
-                    after_ticker = line_text[ticker_idx + len(found_ticker) :]
-
-                    tokens = re.findall(
-                        r"(?:(?:\d{1,3}(?:\s\d{3})+|\d+)(?:[,\.]\d+)?|[\-—–])",
-                        after_ticker,
-                    )
-
-                    if len(tokens) >= 5:
-                        max_price_token = tokens[-5]
-                        price_num = self.clean_number(max_price_token)
-
-                        if price_num and price_num >= 1000:
-                            self.bulletin_data[found_ticker] = (
-                                self.round_up_thousands(price_num)
-                            )
-
-    def download_latest_bulletin(self):
-        self.log("Запрос свежего бюллетеня с spimex.com...", "info")
-        self.update_status("Подключение к spimex.com...")
-        url = "https://spimex.com/markets/oil_products/trades/results/"
-
+    def fetch_ticker_data_for_month(self, ticker, target_month, target_year):
+        """
+        Скачивает страницу и ищет данные строго внутри tbody таблицы результатов торгов.
+        Возвращает словарь {date_str: rounded_price}
+        """
+        url = f"https://spimex.com/markets/oil_products/instruments/list/detail.php?code={ticker}"
+        results = {}
         try:
-            res = self.session.get(url, timeout=15)
+            res = self.session.get(url, timeout=12)
             if res.status_code != 200:
-                self.log(
-                    f"[!] Ошибка загрузки страницы: HTTP {res.status_code}",
-                    "error",
-                )
-                return False
-
-            from bs4 import BeautifulSoup
+                self.log(f"[!] {ticker}: ошибка HTTP {res.status_code}", "error")
+                return results
 
             soup = BeautifulSoup(res.text, "html.parser")
-
-            download_link = None
-            for a in soup.find_all("a", href=True):
-                href = a["href"].lower()
-                if ".pdf" in href and (
-                    "upload" in href or "bulletin" in href or "oil" in href
-                ):
-                    download_link = urllib.parse.urljoin(url, a["href"])
-                    break
-
-            if not download_link:
-                self.log("[!] Ссылка на PDF-бюллетень не найдена.", "error")
-                return False
-
-            self.log(f"Загрузка PDF файла: {download_link}", "info")
-            self.update_status("Скачивание PDF бюллетеня...")
-            file_res = self.session.get(download_link, timeout=30)
-
-            if file_res.status_code != 200 or not file_res.content.startswith(
-                b"%PDF"
-            ):
-                self.log(
-                    "[!] Скачанный файл не является корректным PDF.", "error"
+            
+            # Находим таблицу по ее точному классу со скриншота
+            table = soup.find("table", class_=lambda x: x and "results_table" in x)
+            if not table:
+                # Запасной вариант поиска через заголовок
+                target_header = soup.find(
+                    lambda tag: tag.name in ["h2", "h3", "div"] and 
+                    "Результаты последних 10 торговых сессий" in tag.text
                 )
-                return False
+                if target_header:
+                    container = target_header.find_parent("div")
+                    if container:
+                        table = container.find("table")
+            
+            if not table:
+                self.log(f"[-] {ticker}: таблица результатов торгов не найдена", "info")
+                return results
 
-            date_match = re.search(
-                r"(\d{8}|\d{2}\.\d{2}\.\d{4})", download_link
-            )
-            if date_match:
-                d_str = date_match.group(1)
-                if len(d_str) == 8 and d_str.isdigit():
-                    self.bulletin_date_str = (
-                        f"{d_str[6:8]}.{d_str[4:6]}.{d_str[:4]}"
-                    )
-                else:
-                    self.bulletin_date_str = d_str
+            # Ищем блок <tbody>, чтобы исключить шапку (<thead>) с её строками-заголовками
+            tbody = table.find("tbody")
+            target_rows = tbody.find_all("tr") if tbody else table.find_all("tr")
+
+            found_rows_count = 0
+
+            for row in target_rows:
+                cols = [c.text.strip() for c in row.find_all(["td", "th"])]
+                if not cols or len(cols) < 4:
+                    continue
+                
+                # Проверяем первую колонку на наличие даты формата ДД.ММ.ГГГГ (например, 01.10.2026)
+                date_match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", cols[0])
+                if date_match:
+                    found_rows_count += 1
+                    day_str, month_str, year_str = date_match.groups()
+                    
+                    if int(month_str) == target_month and int(year_str) == target_year:
+                        trade_date = f"{day_str}.{month_str}.{year_str}"
+                        
+                        # 4-я колонка (индекс 3) — «Последняя» цена со скриншота
+                        last_price_raw = cols[3]
+                        price_num = self.clean_number(last_price_raw)
+                        
+                        if price_num:
+                            rounded_price = self.round_up_thousands(price_num)
+                            results[trade_date] = rounded_price
+
+            if found_rows_count > 0:
+                self.log(f"[i] {ticker}: найдено строк в tbody: {found_rows_count}, подошло за месяц: {len(results)}", "info")
             else:
-                self.bulletin_date_str = datetime.date.today().strftime(
-                    "%d.%m.%Y"
-                )
+                self.log(f"[-] {ticker}: в таблице не найдены строки с датами торгов", "info")
 
-            try:
-                dt = datetime.datetime.strptime(
-                    self.bulletin_date_str, "%d.%m.%Y"
-                )
-                self.bulletin_date_str = dt.strftime("%d.%m.%Y")
-            except ValueError:
-                pass
-
-            self.log(
-                f"PDF успешно загружен. Дата бюллетеня: {self.bulletin_date_str}",
-                "success",
-            )
-            self.update_status("Парсинг PDF...")
-
-            self.parse_pdf_bytes(file_res.content)
-            self.log(
-                f"Извлечено позиций: {len(self.bulletin_data)} из {len(self.excel_tickers)}",
-                "success",
-            )
-            return True
+            return results
 
         except Exception as e:
-            self.log(f"[!] Ошибка обработки PDF: {e}", "error")
-            return False
+            self.log(f"[!] Ошибка парсинга {ticker}: {e}", "error")
+            return results
+
+    def fetch_all_tickers_data(self, target_month, target_year):
+        """Опрашивает страницы всех тикеров за указанный месяц"""
+        self.bulletin_data.clear()
+        total = len(self.excel_tickers)
+        
+        for idx, ticker in enumerate(sorted(self.excel_tickers), 1):
+            self.update_status(f"Парсинг {idx}/{total}: {ticker}...")
+            month_data = self.fetch_ticker_data_for_month(ticker, target_month, target_year)
+            
+            if month_data:
+                self.bulletin_data[ticker] = month_data
+                for d_str, price in month_data.items():
+                    self.log(f"[✓] {ticker} | Дата: {d_str} | Последняя: {price}", "success")
+            else:
+                self.log(f"[-] {ticker}: данные за {target_month:02d}.{target_year} не найдены", "info")
+
+    def get_or_create_sheet_for_current_month(self, wb):
+        """Определяет имя листа для текущего месяца (например T10) и делает его активным"""
+        now = datetime.datetime.now()
+        sheet_name = f"Т{now.month}"
+        
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = wb.create_sheet(title=sheet_name)
+            self.log(f"[i] Создан новый лист: {sheet_name}", "info")
+            
+        wb.active = ws
+        self.log(f"Активный лист в Excel: {sheet_name}", "info")
+        return ws, now.month, now.year
 
     def run_monitoring(self):
         self.btn_run.config(
@@ -480,17 +462,21 @@ class SpimexParserApp:
         self.log("\n================ ЗАПУСК МОНИТОРИНГА ================")
 
         try:
-            self.load_excel_tickers()
+            wb = openpyxl.load_workbook(self.file_path)
+            ws, target_month, target_year = self.get_or_create_sheet_for_current_month(wb)
 
-            if not self.download_latest_bulletin():
-                self.log("[!] Процесс остановлен.", "error")
+            self.load_excel_tickers(ws)
+
+            if not self.excel_tickers:
+                self.log("[!] Ошибка: тикеры в листе Excel не найдены.", "error")
                 self.update_status("Ошибка выполнения")
                 return
 
-            self.update_status("Запись данных в Excel...")
-            wb = openpyxl.load_workbook(self.file_path)
-            ws = wb.active
+            self.fetch_all_tickers_data(target_month, target_year)
 
+            self.update_status("Запись данных в Excel...")
+
+            # Считываем имеющиеся даты во 2-й строке Excel (с поддержкой объектов дат и текста)
             date_columns = {}
             for col in range(3, ws.max_column + 1):
                 val = ws.cell(row=2, column=col).value
@@ -500,71 +486,65 @@ class SpimexParserApp:
                     else:
                         d_raw = str(val).strip()
                         d_parts = re.findall(r"\d+", d_raw)
-                        if len(d_parts) == 3:
-                            date_str = f"{int(d_parts[0]):02d}.{int(d_parts[1]):02d}.{d_parts[2]}"
+                        if len(d_parts) >= 2:
+                            day = int(d_parts[0])
+                            month = int(d_parts[1])
+                            year = int(d_parts[2]) if len(d_parts) > 2 else target_year
+                            date_str = f"{day:02d}.{month:02d}.{year}"
                         else:
                             date_str = d_raw
                     date_columns[date_str] = col
 
-            processed_count = 0
+            added_count = 0
+            skipped_count = 0
+
             for row in range(4, ws.max_row + 1):
                 cell_val = ws.cell(row=row, column=1).value
 
-                if (
-                    cell_val
-                    and str(cell_val).strip() != "Тариф"
-                    and len(str(cell_val).strip()) >= 6
-                ):
+                if cell_val and self.is_valid_ticker(cell_val):
                     ticker = str(cell_val).strip()
                     tariff_row = row - 1
 
                     if ticker in self.bulletin_data:
-                        price = self.bulletin_data[ticker]
-                        trade_date_str = self.bulletin_date_str
+                        ticker_month_data = self.bulletin_data[ticker]
 
-                        col_idx = date_columns.get(trade_date_str)
-                        if not col_idx:
-                            alt_date = f"{int(trade_date_str[:2])}.{int(trade_date_str[3:5])}.{trade_date_str[6:]}"
-                            col_idx = date_columns.get(alt_date)
+                        for trade_date_str, price in ticker_month_data.items():
+                            col_idx = date_columns.get(trade_date_str)
+                            if not col_idx:
+                                alt_date = f"{int(trade_date_str[:2])}.{int(trade_date_str[3:5])}.{trade_date_str[6:]}"
+                                col_idx = date_columns.get(alt_date)
 
-                        if col_idx:
-                            col_letter = openpyxl.utils.get_column_letter(
-                                col_idx
-                            )
-                            ws.cell(
-                                row=tariff_row, column=col_idx
-                            ).value = price
-                            formula = (
-                                f"={col_letter}{tariff_row}+$B${tariff_row}"
-                            )
-                            ws.cell(row=row, column=col_idx).value = formula
+                            if col_idx:
+                                # ПРОВЕРКА: Если ячейка с тарифом пустая, записываем! Если уже есть — НЕ перезаписываем.
+                                current_tariff_val = ws.cell(row=tariff_row, column=col_idx).value
+                                
+                                if current_tariff_val is None or str(current_tariff_val).strip() == "":
+                                    col_letter = openpyxl.utils.get_column_letter(col_idx)
+                                    ws.cell(row=tariff_row, column=col_idx).value = price
+                                    
+                                    formula = f"={col_letter}{tariff_row}+$B${tariff_row}"
+                                    ws.cell(row=row, column=col_idx).value = formula
 
-                            self.log(
-                                f"[✓] {ticker} | Дата: {trade_date_str} | Макс. сумма: {price}",
-                                "success",
-                            )
-                            processed_count += 1
-                        else:
-                            self.log(
-                                f"[!] Дата {trade_date_str} отсутствует во 2-й строке Excel.",
-                                "error",
-                            )
-                    else:
-                        self.log(
-                            f"[-] {ticker}: нет торгов на СПбМТСБ.", "info"
-                        )
+                                    added_count += 1
+                                else:
+                                    skipped_count += 1
+                            else:
+                                self.log(
+                                    f"[!] Дата {trade_date_str} для {ticker} отсутствует во 2-й строке Excel.",
+                                    "error",
+                                )
 
             output_file = self.file_path.replace(".xlsx", "_updated.xlsx")
             wb.save(output_file)
 
             self.log(
-                f"\nУСПЕШНО ЗАВЕРШЕНО!\nРезультат сохранен: {output_file}",
+                f"\nУСПЕШНО ЗАВЕРШЕНО!\nЗаписано новых ячеек: {added_count}\nПропущено (уже заполнены): {skipped_count}\nРезультат сохранен: {output_file}",
                 "success",
             )
-            self.update_status(f"Завершено. Обновлено строк: {processed_count}")
+            self.update_status(f"Завершено. Добавлено: {added_count}, Пропущено: {skipped_count}")
             messagebox.showinfo(
                 "Успех",
-                f"Мониторинг успешно завершен!\n\nОбновлено позиций: {processed_count}\nФайл сохранен рядом с исходным.",
+                f"Мониторинг успешно завершен!\n\nЗаписано новых цен: {added_count}\nПропущено (уже есть данные): {skipped_count}\n\nФайл сохранен рядом с исходным.",
             )
 
         except PermissionError:
