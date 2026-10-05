@@ -300,7 +300,7 @@ class SpimexParserApp:
             self.update_status(f"Загружен файл {basename}")
 
     def is_valid_ticker(self, val_str):
-        """Проверяет, является ли строка валидным тикером СПбМТСБ"""
+        """Проверяет, является ли строка валидным тикером СПбМТСБ (поддерживает дефисы)"""
         if not val_str:
             return False
         
@@ -310,7 +310,8 @@ class SpimexParserApp:
         if t_lower in self.excluded_names:
             return False
 
-        if re.match(r"^[A-Z0-9]{7,12}$", t_clean, re.IGNORECASE):
+        # Добавлен дефис в класс символов: [A-Z0-9-]
+        if re.match(r"^[A-Z0-9-]{7,15}$", t_clean, re.IGNORECASE):
             return True
 
         return False
